@@ -2,11 +2,11 @@
  * dupfinder.c — Interactive duplicate file finder
  *
  * Usage:
- *   dupfinder <folder> [-r] [-d] [--dry-run]
+ *   dupfinder <folder> [-r] [-d] [-n]
  *
  *   -r           Scan subdirectories recursively
- *   -d           Auto-delete duplicates (keep first, delete rest)
- *   --dry-run    Simulate deletions without touching any file
+ *   -d           Auto-delete duplicates (keep first)
+ *   -n           Dry-run (no deletion)
  *
  * Dependencies: openssl, ncursesw
  * Compile:
@@ -22,6 +22,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+/* ─── Function prototypes ───────────────────────────────────────── */
+
+static void scan_directory(const char *base, int recursive);
+static int compare_size(const void *a, const void *b);
+
+static int compute_md5(const char *path, unsigned char *out);
+static int hashes_equal(const unsigned char *h1, const unsigned char *h2);
+static int files_are_identical(const char *a, const char *b);
+
+static int prompt_group(char **group, size_t *sizes, int count,
+                        int group_index, int total_groups,
+                        int auto_delete, int dry_run);
+
+static void delete_file(const char *path, size_t size, int dry_run);
+
+static int count_duplicate_groups(void);
+static void process_groups(int total_groups, int auto_delete, int dry_run);
+
+static void scan_and_sort(const char *path, int recursive);
+static void cleanup(void);
+static void print_summary(int total_groups, int dry_run);
+
+static void usage(const char *prog);
+static void usage_exit(const char *prog, int code);
+static void parse_args(int argc, char *argv[],
+                       int *recursive, int *auto_delete, int *dry_run);
 
 /* ─── Constants ──────────────────────────────────────────────────── */
 
@@ -46,6 +74,7 @@ static FileEntry files[MAX_FILES];
 static int file_count = 0;
 static int visited[MAX_FILES];
 static long long freed_bytes = 0;
+extern int optind;
 
 /* ─── File utilities ─────────────────────────────────────────────── */
 
@@ -118,6 +147,20 @@ static int hashes_equal(const unsigned char *h1, const unsigned char *h2)
     return memcmp(h1, h2, MD5_DIGEST_LENGTH) == 0;
 }
 
+static void scan_and_sort(const char *path, int recursive)
+{
+    printf("Scanning %s%s…\n", path, recursive ? " (recursive)" : "");
+    scan_directory(path, recursive);
+    qsort(files, (size_t)file_count, sizeof(FileEntry), compare_size);
+    printf("Found %d file(s). Looking for duplicates…\n\n", file_count);
+}
+
+static void cleanup(void)
+{
+    for (int i = 0; i < file_count; i++)
+        free(files[i].path);
+}
+
 /* ─── Directory scan ─────────────────────────────────────────────── */
 
 static void scan_directory(const char *base, int recursive)
@@ -174,6 +217,104 @@ static void scan_directory(const char *base, int recursive)
     closedir(dir);
 }
 
+/* ─── Groups ───────────────────────────────────────────────────── */
+
+static int count_duplicate_groups(void)
+{
+    int total = 0;
+
+    for (int i = 0; i < file_count; i++)
+    {
+        if (visited[i])
+            continue;
+
+        for (int j = i + 1; j < file_count; j++)
+        {
+            if (files[i].size != files[j].size)
+                break;
+            if (visited[j])
+                continue;
+
+            if (!files[i].hash_computed)
+            {
+                compute_md5(files[i].path, files[i].hash);
+                files[i].hash_computed = 1;
+            }
+            if (!files[j].hash_computed)
+            {
+                compute_md5(files[j].path, files[j].hash);
+                files[j].hash_computed = 1;
+            }
+
+            if (hashes_equal(files[i].hash, files[j].hash) &&
+                files_are_identical(files[i].path, files[j].path))
+            {
+                total++;
+                break;
+            }
+        }
+    }
+
+    return total;
+}
+
+static void process_groups(int total_groups, int auto_delete, int dry_run)
+{
+    memset(visited, 0, sizeof(visited));
+    int group_index = 0;
+
+    for (int i = 0; i < file_count; i++)
+    {
+        if (visited[i])
+            continue;
+
+        char *group[MAX_FILES];
+        size_t group_sizes[MAX_FILES];
+        int count = 0;
+
+        group[count] = files[i].path;
+        group_sizes[count++] = files[i].size;
+
+        for (int j = i + 1; j < file_count; j++)
+        {
+            if (files[i].size != files[j].size)
+                break;
+            if (visited[j])
+                continue;
+
+            if (!files[i].hash_computed)
+            {
+                compute_md5(files[i].path, files[i].hash);
+                files[i].hash_computed = 1;
+            }
+            if (!files[j].hash_computed)
+            {
+                compute_md5(files[j].path, files[j].hash);
+                files[j].hash_computed = 1;
+            }
+
+            if (!hashes_equal(files[i].hash, files[j].hash))
+                continue;
+
+            if (files_are_identical(files[i].path, files[j].path))
+            {
+                group[count] = files[j].path;
+                group_sizes[count++] = files[j].size;
+                visited[j] = 1;
+            }
+        }
+
+        if (count > 1)
+        {
+            group_index++;
+            prompt_group(group, group_sizes, count,
+                         group_index, total_groups,
+                         auto_delete, dry_run);
+            visited[i] = 1;
+        }
+    }
+}
+
 /* ─── Deletion ───────────────────────────────────────────────────── */
 
 static void delete_file(const char *path, size_t size, int dry_run)
@@ -228,6 +369,27 @@ static void format_size(char *buf, size_t sz)
         snprintf(buf, 16, "%.1f KB", sz / 1024.0);
     else
         snprintf(buf, 16, "%zu B", sz);
+}
+
+static void print_summary(int total_groups, int dry_run)
+{
+    printf("\n┌─────────────────────────────────┐\n");
+    printf("│           Summary               │\n");
+    printf("├─────────────────────────────────┤\n");
+    printf("│  Groups found   : %-13d │\n", total_groups);
+
+    if (dry_run)
+        printf("│  Mode           : DRY-RUN       │\n");
+
+    char freed_str[16];
+    snprintf(freed_str, sizeof(freed_str), "%.2f MB", freed_bytes / MB);
+
+    for (char *p = freed_str; *p; p++)
+        if (*p == ',')
+            *p = '.';
+
+    printf("│  Space freed    : %-13s │\n", freed_str);
+    printf("└─────────────────────────────────┘\n");
 }
 
 /* ─── Interactive ncurses prompt ─────────────────────────────────── */
@@ -469,16 +631,60 @@ static int prompt_group(char **group, size_t *sizes, int count,
     return 1;
 }
 
+/* ─── Argument parsing ───────────────────────────────────────────── */
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+            "Usage: %s <folder> [-r] [-d] [-n]\n\n"
+            "Options:\n"
+            "  -r    Scan subdirectories recursively\n"
+            "  -d    Auto-delete duplicates (keep first)\n"
+            "  -n    Dry-run (no deletion)\n",
+            prog);
+}
+
+static void usage_exit(const char *prog, int code)
+{
+    usage(prog);
+    exit(code);
+}
+
+static void parse_args(int argc, char *argv[],
+                       int *recursive, int *auto_delete, int *dry_run)
+{
+    int opt;
+    while ((opt = getopt(argc, argv, "rdn")) != -1)
+    {
+        switch (opt)
+        {
+        case 'r':
+            *recursive = 1;
+            break;
+        case 'd':
+            *auto_delete = 1;
+            break;
+        case 'n':
+            *dry_run = 1;
+            break;
+        default:
+            usage_exit(argv[0], 1);
+        }
+    }
+
+    if (optind >= argc)
+    {
+        usage_exit(argv[0], 1);
+    }
+}
+
 /* ─── Entry point ────────────────────────────────────────────────── */
 
 int main(int argc, char *argv[])
 {
     if (argc < 2)
     {
-        printf("Usage: %s <folder> [-r] [-d] [--dry-run]\n\n", argv[0]);
-        printf("  -r           Recursive scan\n");
-        printf("  -d           Auto-delete duplicates (keep first)\n");
-        printf("  --dry-run    Simulate without deleting\n");
+        usage(argv[0]);
         return 1;
     }
 
@@ -486,59 +692,15 @@ int main(int argc, char *argv[])
     int auto_delete = 0;
     int dry_run = 0;
 
-    for (int i = 2; i < argc; i++)
-    {
-        if (strcmp(argv[i], "-r") == 0)
-            recursive = 1;
-        else if (strcmp(argv[i], "-d") == 0)
-            auto_delete = 1;
-        else if (strcmp(argv[i], "--dry-run") == 0)
-            dry_run = 1;
-    }
+    parse_args(argc, argv, &recursive, &auto_delete, &dry_run);
 
     setlocale(LC_ALL, "");
     memset(visited, 0, sizeof(visited));
 
-    /* ── Scan & sort ── */
-    printf("Scanning %s%s…\n", argv[1], recursive ? " (recursive)" : "");
-    scan_directory(argv[1], recursive);
-    qsort(files, (size_t)file_count, sizeof(FileEntry), compare_size);
-    printf("Found %d file(s). Looking for duplicates…\n\n", file_count);
+    const char *folder = argv[optind];
+    scan_and_sort(folder, recursive);
 
-    /* ── Find & process groups ── */
-
-    /* First pass: count groups so we can show "Group N / total" */
-    int total_groups = 0;
-    for (int i = 0; i < file_count; i++)
-    {
-        if (visited[i])
-            continue;
-        for (int j = i + 1; j < file_count; j++)
-        {
-            if (files[i].size != files[j].size)
-                break;
-            if (visited[j])
-                continue;
-
-            if (!files[i].hash_computed)
-            {
-                compute_md5(files[i].path, files[i].hash);
-                files[i].hash_computed = 1;
-            }
-            if (!files[j].hash_computed)
-            {
-                compute_md5(files[j].path, files[j].hash);
-                files[j].hash_computed = 1;
-            }
-
-            if (hashes_equal(files[i].hash, files[j].hash) &&
-                files_are_identical(files[i].path, files[j].path))
-            {
-                total_groups++;
-                break;
-            }
-        }
-    }
+    int total_groups = count_duplicate_groups();
 
     if (total_groups == 0)
     {
@@ -546,86 +708,11 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    /* Reset visited for second pass */
-    memset(visited, 0, sizeof(visited));
+    process_groups(total_groups, auto_delete, dry_run);
 
-    int group_index = 0;
+    print_summary(total_groups, dry_run);
 
-    for (int i = 0; i < file_count; i++)
-    {
-        if (visited[i])
-            continue;
-
-        char *group[MAX_FILES];
-        size_t group_sizes[MAX_FILES];
-        int group_count = 0;
-
-        group[group_count] = files[i].path;
-        group_sizes[group_count] = files[i].size;
-        group_count++;
-
-        for (int j = i + 1; j < file_count; j++)
-        {
-            if (files[i].size != files[j].size)
-                break;
-            if (visited[j])
-                continue;
-
-            if (!files[i].hash_computed)
-            {
-                compute_md5(files[i].path, files[i].hash);
-                files[i].hash_computed = 1;
-            }
-            if (!files[j].hash_computed)
-            {
-                compute_md5(files[j].path, files[j].hash);
-                files[j].hash_computed = 1;
-            }
-
-            if (!hashes_equal(files[i].hash, files[j].hash))
-                continue;
-
-            if (files_are_identical(files[i].path, files[j].path))
-            {
-                group[group_count] = files[j].path;
-                group_sizes[group_count] = files[j].size;
-                group_count++;
-                visited[j] = 1;
-            }
-        }
-
-        if (group_count > 1)
-        {
-            group_index++;
-            prompt_group(group, group_sizes, group_count,
-                         group_index, total_groups,
-                         auto_delete, dry_run);
-            visited[i] = 1;
-        }
-    }
-
-    /* ── Summary ── */
-    printf("\n┌─────────────────────────────────┐\n");
-    printf("│           Summary               │\n");
-    printf("├─────────────────────────────────┤\n");
-    printf("│  Groups found   : %-13d │\n", total_groups);
-    if (dry_run)
-    {
-        printf("│  Mode           : DRY-RUN       │\n");
-    }
-    /* Format size into a string first so the locale decimal separator
-     * (e.g. ',' on French systems) doesn't break column alignment. */
-    char freed_str[16];
-    snprintf(freed_str, sizeof(freed_str), "%.2f MB", freed_bytes / MB);
-    for (char *p = freed_str; *p; p++)
-        if (*p == ',')
-            *p = '.';
-    printf("│  Space freed    : %-13s │\n", freed_str);
-    printf("└─────────────────────────────────┘\n");
-
-    /* Cleanup file paths */
-    for (int i = 0; i < file_count; i++)
-        free(files[i].path);
+    cleanup();
 
     return 0;
 }
