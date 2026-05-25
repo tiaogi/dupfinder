@@ -1,4 +1,4 @@
-# DupFinder
+# dedupf
 
 A fast interactive duplicate file finder written in C with a ncurses-based TUI.
 
@@ -15,7 +15,7 @@ A fast interactive duplicate file finder written in C with a ncurses-based TUI.
 ## Usage
 
 ```bash
-dupfinder <folder> [-r] [-d] [--dry-run]
+dedupf <folder> [-r] [-d] [--dry-run]
 ```
 
 ### Options
@@ -27,9 +27,9 @@ dupfinder <folder> [-r] [-d] [--dry-run]
 ## Example
 
 ```bash
-./dupfinder ~/Downloads -r
-./dupfinder ~/Pictures -r --dry-run
-./dupfinder ~/Music -r -d
+./dedupf ~/Downloads -r
+./dedupf ~/Pictures -r --dry-run
+./dedupf ~/Music -r -d
 ```
 
 ## Build
@@ -43,7 +43,7 @@ dupfinder <folder> [-r] [-d] [--dry-run]
 ### Compile
 
 ```bash
-gcc dupfinder.c -o dupfinder -lssl -lcrypto -lncursesw
+gcc dedupf.c -o dedupf -lssl -lcrypto -lncursesw
 ```
 
 Or use the Makefile:
@@ -59,8 +59,8 @@ CC=gcc
 CFLAGS=-Wall -Wextra -O2
 LIBS=-lssl -lcrypto -lncursesw
 
-TARGET=dupfinder
-SRC=dupfinder.c
+TARGET=dedupf
+SRC=dedupf.c
 
 all:
     $(CC) $(CFLAGS) $(SRC) -o $(TARGET) $(LIBS)

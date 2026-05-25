@@ -1,12 +1,12 @@
 CC = gcc
-TARGET = dupfinder
+TARGET = dedupf
 
 CFLAGS = -Wall -Wextra -O2
 DEBUG_FLAGS = -g -O0
 
 LIBS = -lncursesw -lcrypto
 
-SRC = dupfinder.c
+SRC = dedupf.c
 OBJ = $(SRC:.c=.o)
 
 all: $(TARGET)

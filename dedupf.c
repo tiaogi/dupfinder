@@ -1,8 +1,8 @@
 /*
- * dupfinder.c — Interactive duplicate file finder
+ * dedupf.c — Interactive duplicate file finder
  *
  * Usage:
- *   dupfinder <folder> [-r] [-d] [-n] [-H] [-t <threads>] [-h]
+ *   dedupf <folder> [-r] [-d] [-n] [-H] [-t <threads>] [-h]
  *
  *   -r           Scan subdirectories recursively
  *   -d           Auto-delete duplicates (keep first)
@@ -13,7 +13,7 @@
  *   -h           Show help
  *
  * Build:
- *   gcc dupfinder.c -o dupfinder -lcrypto -lncursesw -lpthread
+ *   gcc dedupf.c -o dedupf -lcrypto -lncursesw -lpthread
  */
 
 #define _GNU_SOURCE
@@ -774,7 +774,7 @@ static int prompt_group(char **paths, size_t *sizes, int count,
             attron(COLOR_PAIR(CP_STATUS) | A_BOLD);
         for (int c = 0; c < cols; c++)
             mvaddch(0, c, ' ');
-        mvprintw(0, 0, " dupfinder  │  Group %d / %d  │  %d duplicate(s)",
+        mvprintw(0, 0, " dedupf  │  Group %d / %d  │  %d duplicate(s)",
                  group_idx, total_groups, count - 1);
         if (color)
             attroff(COLOR_PAIR(CP_STATUS) | A_BOLD);
