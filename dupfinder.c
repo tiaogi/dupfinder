@@ -2,11 +2,12 @@
  * dupfinder.c — Interactive duplicate file finder
  *
  * Usage:
- *   dupfinder <folder> [-r] [-d] [-n] [-h]
+ *   dupfinder <folder> [-r] [-d] [-n] [-H] [-h]
  *
  *   -r    Scan subdirectories recursively
  *   -d    Auto-delete duplicates (keep first)
  *   -n    Dry-run (no deletion)
+ *   -H    Include hidden files and directories (starting with .)
  *   -h    Show help
  *
  * Build:
@@ -183,7 +184,7 @@ static int entries_match(FileEntry *a, FileEntry *b)
 
 /* ── Directory scan ─────────────────────────────────────────────── */
 
-static void scan_dir(const char *base, int recursive)
+static void scan_dir(const char *base, int recursive, int include_hidden)
 {
     DIR *dir = opendir(base);
     if (!dir)
@@ -197,9 +198,14 @@ static void scan_dir(const char *base, int recursive)
 
     while ((de = readdir(dir)) != NULL)
     {
+        /* Always skip . and .. */
         if (de->d_name[0] == '.' &&
             (de->d_name[1] == '\0' ||
              (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+            continue;
+
+        /* Skip hidden entries unless -H was given */
+        if (!include_hidden && de->d_name[0] == '.')
             continue;
 
         int sep = base[strlen(base) - 1] != '/';
@@ -211,7 +217,7 @@ static void scan_dir(const char *base, int recursive)
 
         if (S_ISDIR(st.st_mode) && recursive)
         {
-            scan_dir(path, recursive);
+            scan_dir(path, recursive, include_hidden);
         }
         else if (S_ISREG(st.st_mode))
         {
@@ -232,10 +238,13 @@ static int cmp_size(const void *a, const void *b)
     return (sa > sb) - (sa < sb);
 }
 
-static void scan_and_sort(const char *path, int recursive)
+static void scan_and_sort(const char *path, int recursive, int include_hidden)
 {
-    printf("Scanning %s%s…\n", path, recursive ? " (recursive)" : "");
-    scan_dir(path, recursive);
+    printf("Scanning %s%s%s…\n",
+           path,
+           recursive ? " (recursive)" : "",
+           include_hidden ? " (including hidden)" : "");
+    scan_dir(path, recursive, include_hidden);
     qsort(g_files.data, g_files.len, sizeof(FileEntry), cmp_size);
     printf("Found %zu file(s). Looking for duplicates…\n\n", g_files.len);
 }
@@ -645,20 +654,22 @@ static const char *prog_name(const char *argv0)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s <folder> [-r] [-d] [-n] [-h]\n\n"
+            "Usage: %s <folder> [-r] [-d] [-n] [-H] [-h]\n\n"
             "Options:\n"
             "  -r    Scan subdirectories recursively\n"
             "  -d    Auto-delete duplicates (keep first)\n"
             "  -n    Dry-run (no deletion)\n"
+            "  -H    Include hidden files and directories (starting with .)\n"
             "  -h    Show help\n",
             prog_name(argv0));
 }
 
 static void parse_args(int argc, char *argv[],
-                       int *recursive, int *auto_delete, int *dry_run)
+                       int *recursive, int *auto_delete, int *dry_run,
+                       int *include_hidden)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "rdnh")) != -1)
+    while ((opt = getopt(argc, argv, "rdnHh")) != -1)
     {
         switch (opt)
         {
@@ -670,6 +681,9 @@ static void parse_args(int argc, char *argv[],
             break;
         case 'n':
             *dry_run = 1;
+            break;
+        case 'H':
+            *include_hidden = 1;
             break;
         case 'h':
             usage(argv[0]);
@@ -696,12 +710,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int recursive = 0, auto_delete = 0, dry_run = 0;
-    parse_args(argc, argv, &recursive, &auto_delete, &dry_run);
+    int recursive = 0, auto_delete = 0, dry_run = 0, include_hidden = 0;
+    parse_args(argc, argv, &recursive, &auto_delete, &dry_run, &include_hidden);
 
     setlocale(LC_ALL, "");
     vec_init(&g_files);
-    scan_and_sort(argv[optind], recursive);
+    scan_and_sort(argv[optind], recursive, include_hidden);
 
     g_visited = calloc(g_files.len, sizeof(int));
     if (!g_visited)
