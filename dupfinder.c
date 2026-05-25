@@ -15,6 +15,7 @@
  */
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <ncursesw/ncurses.h>
 #include <openssl/evp.h>
@@ -23,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ── Constants ──────────────────────────────────────────────────── */
@@ -292,6 +295,44 @@ static void delete_file(const char *path, size_t size, int dry_run)
     }
 }
 
+/* ── File opener ────────────────────────────────────────────────── */
+
+/*
+ * Opens a file with the system's default application via xdg-open.
+ * Forks a child process so ncurses is not disturbed; the application
+ * runs in the background while the TUI stays active.
+ * stdout/stderr of the child are redirected to /dev/null to prevent
+ * any output from xdg-open from corrupting the ncurses display.
+ */
+static void open_file(const char *path)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return; /* fork failed — silently ignore */
+
+    if (pid == 0)
+    {
+        /* ── child ── */
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0)
+        {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        /* Detach from the process group so signals (e.g. SIGINT) sent to
+         * the parent terminal do not reach the spawned application. */
+        setsid();
+        execlp("xdg-open", "xdg-open", path, NULL);
+        _exit(1); /* execlp failed */
+    }
+
+    /* ── parent ──
+     * WNOHANG: don't block the TUI — the child (and the app it launches)
+     * lives on independently after xdg-open exits. */
+    waitpid(pid, NULL, WNOHANG);
+}
+
 /* ── TUI helpers ────────────────────────────────────────────────── */
 
 static void format_size(char *buf, size_t sz)
@@ -337,7 +378,7 @@ static void init_colors(void)
 
 /*
  * Displays a group of duplicate files in a full-screen ncurses UI.
- * Navigation: ↑/↓ or j/k · SPACE toggles selection · ENTER confirms · Q skips.
+ * Navigation: ↑/↓ or j/k · SPACE toggles selection · O opens · ENTER confirms · Q skips.
  * At least one file is always kept (selection is capped at count-1).
  */
 static int prompt_group(char **paths, size_t *sizes, int count,
@@ -453,7 +494,7 @@ static int prompt_group(char **paths, size_t *sizes, int count,
         if (color)
             attron(COLOR_PAIR(CP_HEADER));
         mvprintw(rows - 3, 2,
-                 "↑↓/jk  navigate    SPACE  select    ENTER  delete selected    Q  skip");
+                 "↑↓/jk  navigate    SPACE  select    O  open    ^O  open all    ENTER  delete selected    Q  skip");
         if (color)
             attroff(COLOR_PAIR(CP_HEADER));
 
@@ -526,6 +567,17 @@ static int prompt_group(char **paths, size_t *sizes, int count,
         {
             memset(selected, 0, count * sizeof(int));
             sel_head = 0;
+        }
+        else if (ch == ('o' & 0x1f)) /* Ctrl+O — open all files in the group */
+        {
+            for (int i = 0; i < count; i++)
+                open_file(paths[i]);
+        }
+        else if (ch == 'o' || ch == 'O')
+        {
+            /* Open the file under the cursor with the system default app.
+             * ncurses stays active — the app launches in the background. */
+            open_file(paths[cursor]);
         }
         else if (ch == '\n' || ch == KEY_ENTER)
         {
