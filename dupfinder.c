@@ -2,11 +2,12 @@
  * dupfinder.c — Interactive duplicate file finder
  *
  * Usage:
- *   dupfinder <folder> [-r] [-d] [-n]
+ *   dupfinder <folder> [-r] [-d] [-n] [-h]
  *
  *   -r           Scan subdirectories recursively
  *   -d           Auto-delete duplicates (keep first)
  *   -n           Dry-run (no deletion)
+ *   -h           Show help
  *
  * Dependencies: openssl, ncursesw
  * Compile:
@@ -633,15 +634,24 @@ static int prompt_group(char **group, size_t *sizes, int count,
 
 /* ─── Argument parsing ───────────────────────────────────────────── */
 
+static const char *prog_name(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
 static void usage(const char *prog)
 {
+    const char *name = prog_name(prog);
+
     fprintf(stderr,
-            "Usage: %s <folder> [-r] [-d] [-n]\n\n"
+            "Usage: %s <folder> [-r] [-d] [-n] [-h]\n\n"
             "Options:\n"
             "  -r    Scan subdirectories recursively\n"
             "  -d    Auto-delete duplicates (keep first)\n"
-            "  -n    Dry-run (no deletion)\n",
-            prog);
+            "  -n    Dry-run (no deletion)\n"
+            "  -h    Show help\n",
+            name);
 }
 
 static void usage_exit(const char *prog, int code)
@@ -654,7 +664,7 @@ static void parse_args(int argc, char *argv[],
                        int *recursive, int *auto_delete, int *dry_run)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "rdn")) != -1)
+    while ((opt = getopt(argc, argv, "rdnh")) != -1)
     {
         switch (opt)
         {
@@ -666,6 +676,9 @@ static void parse_args(int argc, char *argv[],
             break;
         case 'n':
             *dry_run = 1;
+            break;
+        case 'h':
+            usage_exit(argv[0], 0);
             break;
         default:
             usage_exit(argv[0], 1);
