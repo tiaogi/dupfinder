@@ -52,6 +52,8 @@ typedef struct
 static FileVec g_files = {0};
 static int *g_visited = NULL;
 static long long g_freed = 0;
+static size_t g_progress = 0;
+static size_t g_total = 0;
 extern int optind;
 
 /* ── FileVec ────────────────────────────────────────────────────── */
@@ -236,6 +238,28 @@ static void scan_and_sort(const char *path, int recursive)
     scan_dir(path, recursive);
     qsort(g_files.data, g_files.len, sizeof(FileEntry), cmp_size);
     printf("Found %zu file(s). Looking for duplicates…\n\n", g_files.len);
+}
+
+static void print_progress(size_t i, size_t total)
+{
+    int width = 30;
+
+    float ratio = total ? (float)i / (float)total : 0.0f;
+    if (ratio > 1.0f)
+        ratio = 1.0f;
+
+    int filled = (int)(ratio * width);
+
+    printf("\r[");
+    for (int j = 0; j < width; j++)
+        putchar(j < filled ? '#' : '-');
+
+    printf("] %3d%% (%zu/%zu)",
+           (int)(ratio * 100),
+           i,
+           total);
+
+    fflush(stdout);
 }
 
 /* ── Deletion ───────────────────────────────────────────────────── */
@@ -532,6 +556,9 @@ static int iterate_groups(int total, GroupHandler on_group,
 
     for (size_t i = 0; i < g_files.len; i++)
     {
+        g_progress = i;
+        print_progress(i, g_files.len);
+
         if (g_visited[i])
             continue;
 
@@ -575,12 +602,18 @@ static int iterate_groups(int total, GroupHandler on_group,
         free(szs);
     }
 
+    print_progress(g_files.len, g_files.len);
+    printf("\n");
+
     return group_idx;
 }
 
 static int count_groups(void) { return iterate_groups(0, NULL, 0, 0); }
 static void process_groups(int total, int ad, int dr)
 {
+    g_total = g_files.len;
+    g_progress = 0;
+    printf("\n");
     iterate_groups(total, prompt_group, ad, dr);
 }
 
