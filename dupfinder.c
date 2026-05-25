@@ -40,12 +40,26 @@
 #define IO_BUF 4096
 #define MB (1024.0 * 1024.0)
 
+/*
+ * Quick-hash: read this many bytes from the start AND from the end
+ * of each file.  A mismatch here means "definitely not identical"
+ * without ever reading the full file.  Must be ≤ IO_BUF.
+ */
+#define QHASH_BYTES 4096
+
 /* ── Types ──────────────────────────────────────────────────────── */
 
 typedef struct
 {
     char *path;
     size_t size;
+
+    /* Partial hash (first + last QHASH_BYTES) */
+    unsigned char qhash[MD5_DIGEST_LENGTH];
+    int qhash_ready;
+    pthread_mutex_t qhash_mutex;
+
+    /* Full MD5 */
     unsigned char hash[MD5_DIGEST_LENGTH];
     int hash_ready;
     pthread_mutex_t hash_mutex; /* protects lazy hash computation */
@@ -135,6 +149,7 @@ static void vec_free(FileVec *v)
     for (size_t i = 0; i < v->len; i++)
     {
         free(v->data[i].path);
+        pthread_mutex_destroy(&v->data[i].qhash_mutex);
         pthread_mutex_destroy(&v->data[i].hash_mutex);
     }
     free(v->data);
@@ -147,16 +162,18 @@ static void vec_push(FileVec *v, FileEntry e)
     if (v->len >= v->cap)
     {
         size_t new_cap = v->cap * 2;
-        FileEntry *new_data = realloc(v->data, new_cap * sizeof(FileEntry));
-        if (!new_data)
+        FileEntry *nd = realloc(v->data, new_cap * sizeof(FileEntry));
+        if (!nd)
         {
             perror("realloc");
             exit(1);
         }
-        v->data = new_data;
+        v->data = nd;
         v->cap = new_cap;
     }
+    e.qhash_ready = 0;
     e.hash_ready = 0;
+    pthread_mutex_init(&e.qhash_mutex, NULL);
     pthread_mutex_init(&e.hash_mutex, NULL);
     v->data[v->len++] = e;
     pthread_mutex_unlock(&v->mutex);
@@ -164,6 +181,9 @@ static void vec_push(FileVec *v, FileEntry e)
 
 /* ── File utilities ─────────────────────────────────────────────── */
 
+/*
+ * Compute MD5 over the whole file.
+ */
 static int compute_md5(const char *path, unsigned char *out)
 {
     FILE *fp = fopen(path, "rb");
@@ -178,7 +198,6 @@ static int compute_md5(const char *path, unsigned char *out)
     }
 
     EVP_DigestInit_ex(ctx, EVP_md5(), NULL);
-
     unsigned char buf[IO_BUF];
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
@@ -186,7 +205,61 @@ static int compute_md5(const char *path, unsigned char *out)
 
     unsigned int len = 0;
     EVP_DigestFinal_ex(ctx, out, &len);
+    EVP_MD_CTX_free(ctx);
+    fclose(fp);
+    return 1;
+}
 
+/*
+ * Compute MD5 over the first QHASH_BYTES + last QHASH_BYTES of the
+ * file.  For files shorter than 2*QHASH_BYTES the entire file is
+ * hashed (identical to the full MD5 for very small files).
+ *
+ * This is the cheap "quick hash" used as a first filter.
+ */
+static int compute_quick_hash(const char *path, size_t file_size,
+                              unsigned char *out)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp)
+        return 0;
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx)
+    {
+        fclose(fp);
+        return 0;
+    }
+
+    EVP_DigestInit_ex(ctx, EVP_md5(), NULL);
+
+    unsigned char buf[QHASH_BYTES];
+    size_t n;
+
+    if (file_size <= 2 * QHASH_BYTES)
+    {
+        /* Small file: hash everything (same result as full MD5). */
+        while ((n = fread(buf, 1, sizeof(buf), fp)) > 0)
+            EVP_DigestUpdate(ctx, buf, n);
+    }
+    else
+    {
+        /* Head: first QHASH_BYTES */
+        n = fread(buf, 1, QHASH_BYTES, fp);
+        if (n > 0)
+            EVP_DigestUpdate(ctx, buf, n);
+
+        /* Tail: last QHASH_BYTES */
+        if (fseeko(fp, -(off_t)QHASH_BYTES, SEEK_END) == 0)
+        {
+            n = fread(buf, 1, QHASH_BYTES, fp);
+            if (n > 0)
+                EVP_DigestUpdate(ctx, buf, n);
+        }
+    }
+
+    unsigned int len = 0;
+    EVP_DigestFinal_ex(ctx, out, &len);
     EVP_MD_CTX_free(ctx);
     fclose(fp);
     return 1;
@@ -225,7 +298,19 @@ static int files_identical(const char *a, const char *b)
     return equal;
 }
 
-/* Thread-safe lazy MD5 computation. */
+/* ── Thread-safe lazy hash helpers ─────────────────────────────── */
+
+static void ensure_qhash(FileEntry *e)
+{
+    pthread_mutex_lock(&e->qhash_mutex);
+    if (!e->qhash_ready)
+    {
+        compute_quick_hash(e->path, e->size, e->qhash);
+        e->qhash_ready = 1;
+    }
+    pthread_mutex_unlock(&e->qhash_mutex);
+}
+
 static void ensure_hash(FileEntry *e)
 {
     pthread_mutex_lock(&e->hash_mutex);
@@ -237,14 +322,36 @@ static void ensure_hash(FileEntry *e)
     pthread_mutex_unlock(&e->hash_mutex);
 }
 
+/*
+ * Three-level comparison pipeline:
+ *
+ *   1. Size equality           (O(1), already guaranteed by caller)
+ *   2. Quick hash equality     (reads ~8 KB per file at most)
+ *   3. Full MD5 equality       (reads the whole file)
+ *   4. Byte-for-byte equality  (final confirmation, catches MD5 collisions)
+ *
+ * Each level is a cheap early-exit: the expensive step is only reached
+ * when all cheaper tests pass.
+ */
 static int entries_match(FileEntry *a, FileEntry *b)
 {
+    /* Level 1 — size (caller already groups by size, but be defensive) */
     if (a->size != b->size)
         return 0;
+
+    /* Level 2 — quick hash (first+last 4 KB) */
+    ensure_qhash(a);
+    ensure_qhash(b);
+    if (memcmp(a->qhash, b->qhash, MD5_DIGEST_LENGTH) != 0)
+        return 0;
+
+    /* Level 3 — full MD5 */
     ensure_hash(a);
     ensure_hash(b);
     if (memcmp(a->hash, b->hash, MD5_DIGEST_LENGTH) != 0)
         return 0;
+
+    /* Level 4 — byte-for-byte (guards against MD5 collisions) */
     return files_identical(a->path, b->path);
 }
 
@@ -288,7 +395,6 @@ static void dirq_push(DirQueue *q, char *path)
     }
     item->path = path;
     item->next = NULL;
-
     pthread_mutex_lock(&q->mutex);
     if (q->tail)
         q->tail->next = item;
@@ -309,12 +415,10 @@ static char *dirq_pop(DirQueue *q)
 {
     pthread_mutex_lock(&q->mutex);
     q->idle++;
-
     while (!q->shutdown)
     {
         if (q->head)
         {
-            /* work available */
             DirItem *item = q->head;
             q->head = item->next;
             if (!q->head)
@@ -326,7 +430,6 @@ static char *dirq_pop(DirQueue *q)
             free(item);
             return p;
         }
-
         /* No work: are all threads idle? */
         if (q->idle == q->total)
         {
@@ -336,10 +439,8 @@ static char *dirq_pop(DirQueue *q)
             pthread_mutex_unlock(&q->mutex);
             return NULL;
         }
-
         pthread_cond_wait(&q->cond, &q->mutex);
     }
-
     q->idle--;
     pthread_mutex_unlock(&q->mutex);
     return NULL;
@@ -366,7 +467,6 @@ static void scan_dir_into_queue(const char *base, DirQueue *q,
             (de->d_name[1] == '\0' ||
              (de->d_name[1] == '.' && de->d_name[2] == '\0')))
             continue;
-
         if (!include_hidden && de->d_name[0] == '.')
             continue;
 
@@ -390,10 +490,10 @@ static void scan_dir_into_queue(const char *base, DirQueue *q,
                 vec_push(&g_files, (FileEntry){
                                        .path = resolved,
                                        .size = (size_t)st.st_size,
+                                       .qhash_ready = 0,
                                        .hash_ready = 0});
         }
     }
-
     closedir(dir);
 }
 
@@ -401,13 +501,11 @@ static void *scan_thread(void *arg)
 {
     ScanArgs *sa = (ScanArgs *)arg;
     char *path;
-
     while ((path = dirq_pop(sa->q)) != NULL)
     {
         scan_dir_into_queue(path, sa->q, sa->recursive, sa->include_hidden);
         free(path);
     }
-
     return NULL;
 }
 
@@ -416,7 +514,6 @@ static void *scan_thread(void *arg)
 static void *hash_thread(void *arg)
 {
     HashQueue *hq = (HashQueue *)arg;
-
     for (;;)
     {
         pthread_mutex_lock(&hq->mutex);
@@ -429,6 +526,8 @@ static void *hash_thread(void *arg)
         hq->next++;
         pthread_mutex_unlock(&hq->mutex);
 
+        /* Pre-compute both hashes in the background. */
+        ensure_qhash(hq->entries[idx]);
         ensure_hash(hq->entries[idx]);
 
         pthread_mutex_lock(&hq->mutex);
@@ -437,7 +536,6 @@ static void *hash_thread(void *arg)
             pthread_cond_broadcast(&hq->done_cond);
         pthread_mutex_unlock(&hq->mutex);
     }
-
     return NULL;
 }
 
@@ -451,10 +549,7 @@ static void parallel_hash(FileEntry **entries, int count, int n_threads)
         return;
 
     HashQueue hq = {
-        .entries = entries,
-        .count = (size_t)count,
-        .next = 0,
-        .finished = 0};
+        .entries = entries, .count = (size_t)count, .next = 0, .finished = 0};
     pthread_mutex_init(&hq.mutex, NULL);
     pthread_cond_init(&hq.done_cond, NULL);
 
@@ -498,8 +593,7 @@ static void scan_and_sort(const char *root, int recursive,
            root,
            recursive ? " (recursive)" : "",
            include_hidden ? " (including hidden)" : "",
-           n_threads,
-           n_threads > 1 ? "s" : "");
+           n_threads, n_threads > 1 ? "s" : "");
 
     DirQueue q;
     dirq_init(&q, n_threads);
@@ -514,7 +608,6 @@ static void scan_and_sort(const char *root, int recursive,
     dirq_push(&q, root_copy);
 
     ScanArgs sa = {.q = &q, .recursive = recursive, .include_hidden = include_hidden};
-
     pthread_t *tids = malloc(n_threads * sizeof(pthread_t));
     if (!tids)
     {
@@ -524,7 +617,6 @@ static void scan_and_sort(const char *root, int recursive,
 
     for (int i = 0; i < n_threads; i++)
         pthread_create(&tids[i], NULL, scan_thread, &sa);
-
     for (int i = 0; i < n_threads; i++)
         pthread_join(tids[i], NULL);
 
@@ -544,7 +636,6 @@ static void print_progress(size_t i, size_t total)
     if (ratio > 1.0f)
         ratio = 1.0f;
     int filled = (int)(ratio * width);
-
     printf("\r[");
     for (int j = 0; j < width; j++)
         putchar(j < filled ? '#' : '-');
@@ -578,7 +669,6 @@ static void open_file(const char *path)
     pid_t pid = fork();
     if (pid < 0)
         return;
-
     if (pid == 0)
     {
         int devnull = open("/dev/null", O_WRONLY);
@@ -592,7 +682,6 @@ static void open_file(const char *path)
         execlp("xdg-open", "xdg-open", path, NULL);
         _exit(1);
     }
-
     waitpid(pid, NULL, WNOHANG);
 }
 
@@ -698,10 +787,7 @@ static int prompt_group(char **paths, size_t *sizes, int count,
 
         for (int i = 0; i < count && (4 + i) < rows - 4; i++)
         {
-            int row = 4 + i;
-            int is_cur = (i == cursor);
-            int is_sel = selected[i];
-
+            int row = 4 + i, is_cur = (i == cursor), is_sel = selected[i];
             if (is_cur)
             {
                 if (color)
@@ -711,15 +797,12 @@ static int prompt_group(char **paths, size_t *sizes, int count,
                 for (int c = 0; c < cols; c++)
                     mvaddch(row, c, ' ');
             }
-
             if (color && is_sel)
                 attron(COLOR_PAIR(CP_OK) | A_BOLD);
             mvprintw(row, 2, "[%c]", is_sel ? 'x' : ' ');
             if (color && is_sel)
                 attroff(COLOR_PAIR(CP_OK) | A_BOLD);
-
             mvprintw(row, 6, "%2d.", i + 1);
-
             char sz[16];
             format_size(sz, sizes[i]);
             if (color)
@@ -727,13 +810,11 @@ static int prompt_group(char **paths, size_t *sizes, int count,
             mvprintw(row, 10, "%-9s", sz);
             if (color)
                 attroff(COLOR_PAIR(CP_DANGER));
-
             if (color && is_sel)
                 attron(COLOR_PAIR(CP_OK));
             print_truncated(row, 20, paths[i], cols - 22);
             if (color && is_sel)
                 attroff(COLOR_PAIR(CP_OK));
-
             if (is_cur)
             {
                 if (color)
@@ -758,10 +839,8 @@ static int prompt_group(char **paths, size_t *sizes, int count,
                 n_sel++;
                 bytes_freed += sizes[i];
             }
-
         char free_sz[16];
         format_size(free_sz, bytes_freed);
-
         if (color)
             attron(COLOR_PAIR(CP_STATUS));
         for (int c = 0; c < cols; c++)
@@ -772,7 +851,6 @@ static int prompt_group(char **paths, size_t *sizes, int count,
             attroff(COLOR_PAIR(CP_STATUS));
 
         refresh();
-
         int ch = getch();
 
         if (ch == 'q' || ch == 'Q')
@@ -861,8 +939,7 @@ static int iterate_groups(int total, GroupHandler on_group,
 
         /* Find the end of the current size-group */
         size_t j = i + 1;
-        while (j < g_files.len &&
-               g_files.data[j].size == g_files.data[i].size)
+        while (j < g_files.len && g_files.data[j].size == g_files.data[i].size)
             j++;
 
         /* If more than one file shares this size, pre-hash them all in parallel */
@@ -917,17 +994,14 @@ static int iterate_groups(int total, GroupHandler on_group,
                     on_group(paths, szs, count, group_idx, total, auto_delete, dry_run);
                 g_visited[ii] = 1;
             }
-
             free(paths);
             free(szs);
         }
-
         i = j;
     }
 
     print_progress(g_files.len, g_files.len);
     printf("\n");
-
     return group_idx;
 }
 
@@ -946,15 +1020,13 @@ static void print_summary(int total_groups, int dry_run)
 {
     char freed_str[16];
     snprintf(freed_str, sizeof(freed_str), "%.2f MB", g_freed / MB);
-
     printf("\n┌─────────────────────────────────┐\n");
     printf("│           Summary               │\n");
     printf("├─────────────────────────────────┤\n");
     printf("│  Groups found   : %-13d │\n", total_groups);
     if (dry_run)
         printf("│  Mode           : DRY-RUN       │\n");
-    printf("│  %-15s: %-13s │\n",
-           dry_run ? "Would free" : "Space freed", freed_str);
+    printf("│  %-15s: %-13s │\n", dry_run ? "Would free" : "Space freed", freed_str);
     printf("└─────────────────────────────────┘\n");
 }
 
@@ -967,22 +1039,17 @@ static void print_summary(int total_groups, int dry_run)
  */
 static int resolve_threads(int requested)
 {
-    int nprocs = get_nprocs(); /* <sys/sysinfo.h> */
+    int nprocs = get_nprocs();
     if (nprocs < 1)
         nprocs = 1;
-
     if (requested <= 0)
         return nprocs;
-
     if (requested > nprocs)
     {
-        fprintf(stderr,
-                "Warning: requested %d threads but system has only %d logical CPU(s). "
-                "Clamping to %d.\n",
+        fprintf(stderr, "Warning: requested %d threads but system has only %d logical CPU(s). Clamping to %d.\n",
                 requested, nprocs, nprocs);
         return nprocs;
     }
-
     return requested;
 }
 
@@ -1065,7 +1132,7 @@ int main(int argc, char *argv[])
     }
 
     int recursive = 0, auto_delete = 0, dry_run = 0, include_hidden = 0;
-    int requested_threads = 0; /* 0 = use all CPUs */
+    int requested_threads = 0;
 
     parse_args(argc, argv, &recursive, &auto_delete, &dry_run,
                &include_hidden, &requested_threads);
