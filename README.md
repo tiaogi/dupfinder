@@ -65,14 +65,15 @@ SRC=dupfinder.c
 all:
     $(CC) $(CFLAGS) $(SRC) -o $(TARGET) $(LIBS)
 
-    clean:
-        rm -f $(TARGET)
+clean:
+    rm -f $(TARGET)
 ```
 
 ## Notes
 
 - Uses MD5 for fast pre-filtering + full byte comparison for safety
-- Limits file scan to 1000 files by default (can be increased in source)\n- Requires a terminal compatible with ncurses
+- Limits file scan to 1000 files by default (can be increased in source)
+- Requires a terminal compatible with ncurses
 
 ## License
 
