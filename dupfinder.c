@@ -25,7 +25,28 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* ─── Data types ─────────────────────────────────────────────────── */
+
+typedef struct
+{
+    char *path;
+    size_t size;
+    unsigned char hash[MD5_DIGEST_LENGTH];
+    int hash_computed;
+} FileEntry;
+
+typedef struct
+{
+    FileEntry *data;
+    size_t size;
+    size_t cap;
+} FileVec;
+
 /* ─── Function prototypes ───────────────────────────────────────── */
+
+static void vec_init(FileVec *v);
+static void vec_free(FileVec *v);
+static void vec_push(FileVec *v, FileEntry e);
 
 static void scan_directory(const char *base, int recursive);
 static int compare_size(const void *a, const void *b);
@@ -54,28 +75,57 @@ static void parse_args(int argc, char *argv[],
 
 /* ─── Constants ──────────────────────────────────────────────────── */
 
-#define MAX_FILES 1000
 #define PATH_BUF 1024
 #define IO_BUF 4096
 #define MB (1024.0 * 1024.0)
 
-/* ─── Data types ─────────────────────────────────────────────────── */
-
-typedef struct
-{
-    char *path;
-    size_t size;
-    unsigned char hash[MD5_DIGEST_LENGTH];
-    int hash_computed;
-} FileEntry;
-
 /* ─── Globals ────────────────────────────────────────────────────── */
 
-static FileEntry files[MAX_FILES];
-static int file_count = 0;
-static int visited[MAX_FILES];
+static FileVec files = {0};
+static int *visited = NULL;
 static long long freed_bytes = 0;
 extern int optind;
+
+static void vec_init(FileVec *v)
+{
+    v->cap = 128;
+    v->size = 0;
+    v->data = malloc(v->cap * sizeof(FileEntry));
+    if (!v->data)
+    {
+        perror("malloc");
+        exit(1);
+    }
+}
+
+/* ─── Dynamic allocation ─────────────────────────────────────────────── */
+
+static void vec_free(FileVec *v)
+{
+    for (size_t i = 0; i < v->size; i++)
+        free(v->data[i].path);
+    free(v->data);
+}
+
+static void vec_push(FileVec *v, FileEntry e)
+{
+    if (v->size >= v->cap)
+    {
+        size_t new_cap = v->cap * 2;
+
+        FileEntry *new_data = realloc(v->data, new_cap * sizeof(FileEntry));
+        if (!new_data)
+        {
+            perror("realloc");
+            exit(1);
+        }
+
+        v->data = new_data;
+        v->cap = new_cap;
+    }
+
+    v->data[v->size++] = e;
+}
 
 /* ─── File utilities ─────────────────────────────────────────────── */
 
@@ -152,14 +202,15 @@ static void scan_and_sort(const char *path, int recursive)
 {
     printf("Scanning %s%s…\n", path, recursive ? " (recursive)" : "");
     scan_directory(path, recursive);
-    qsort(files, (size_t)file_count, sizeof(FileEntry), compare_size);
-    printf("Found %d file(s). Looking for duplicates…\n\n", file_count);
+    qsort(files.data, files.size, sizeof(FileEntry), compare_size);
+    printf("Found %zu file(s). Looking for duplicates…\n\n", files.size);
 }
 
 static void cleanup(void)
 {
-    for (int i = 0; i < file_count; i++)
-        free(files[i].path);
+    vec_free(&files);
+    if (visited)
+        free(visited);
 }
 
 /* ─── Directory scan ─────────────────────────────────────────────── */
@@ -178,11 +229,6 @@ static void scan_directory(const char *base, int recursive)
 
     while ((entry = readdir(dir)) != NULL)
     {
-        if (file_count >= MAX_FILES)
-        {
-            fprintf(stderr, "Warning: file limit (%d) reached.\n", MAX_FILES);
-            break;
-        }
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
             continue;
 
@@ -193,10 +239,9 @@ static void scan_directory(const char *base, int recursive)
         if (stat(path, &st) == -1)
             continue;
 
-        if (S_ISDIR(st.st_mode))
+        if (S_ISDIR(st.st_mode) && recursive)
         {
-            if (recursive)
-                scan_directory(path, recursive);
+            scan_directory(path, recursive);
         }
         else if (S_ISREG(st.st_mode))
         {
@@ -207,10 +252,13 @@ static void scan_directory(const char *base, int recursive)
             char *resolved = realpath(path, NULL);
             if (resolved)
             {
-                files[file_count].path = resolved;
-                files[file_count].size = (size_t)st.st_size;
-                files[file_count].hash_computed = 0;
-                file_count++;
+                FileEntry e = {0};
+
+                e.path = resolved;
+                e.size = (size_t)st.st_size;
+                e.hash_computed = 0;
+
+                vec_push(&files, e);
             }
         }
     }
@@ -224,31 +272,31 @@ static int count_duplicate_groups(void)
 {
     int total = 0;
 
-    for (int i = 0; i < file_count; i++)
+    for (size_t i = 0; i < files.size; i++)
     {
         if (visited[i])
             continue;
 
-        for (int j = i + 1; j < file_count; j++)
+        for (size_t j = i + 1; j < files.size; j++)
         {
-            if (files[i].size != files[j].size)
+            if (files.data[i].size != files.data[j].size)
                 break;
             if (visited[j])
                 continue;
 
-            if (!files[i].hash_computed)
+            if (!files.data[i].hash_computed)
             {
-                compute_md5(files[i].path, files[i].hash);
-                files[i].hash_computed = 1;
+                compute_md5(files.data[i].path, files.data[i].hash);
+                files.data[i].hash_computed = 1;
             }
-            if (!files[j].hash_computed)
+            if (!files.data[j].hash_computed)
             {
-                compute_md5(files[j].path, files[j].hash);
-                files[j].hash_computed = 1;
+                compute_md5(files.data[j].path, files.data[j].hash);
+                files.data[j].hash_computed = 1;
             }
 
-            if (hashes_equal(files[i].hash, files[j].hash) &&
-                files_are_identical(files[i].path, files[j].path))
+            if (hashes_equal(files.data[i].hash, files.data[j].hash) &&
+                files_are_identical(files.data[i].path, files.data[j].path))
             {
                 total++;
                 break;
@@ -261,46 +309,55 @@ static int count_duplicate_groups(void)
 
 static void process_groups(int total_groups, int auto_delete, int dry_run)
 {
-    memset(visited, 0, sizeof(visited));
+    memset(visited, 0, files.size * sizeof(int));
     int group_index = 0;
 
-    for (int i = 0; i < file_count; i++)
+    for (size_t i = 0; i < files.size; i++)
     {
         if (visited[i])
             continue;
 
-        char *group[MAX_FILES];
-        size_t group_sizes[MAX_FILES];
+        char **group = malloc(files.size * sizeof(*group));
+        size_t *group_sizes = malloc(files.size * sizeof(*group_sizes));
+
+        if (!group || !group_sizes)
+        {
+            perror("malloc");
+            free(group);
+            free(group_sizes);
+            return;
+        }
+
         int count = 0;
 
-        group[count] = files[i].path;
-        group_sizes[count++] = files[i].size;
+        group[count] = files.data[i].path;
+        group_sizes[count++] = files.data[i].size;
 
-        for (int j = i + 1; j < file_count; j++)
+        for (size_t j = i + 1; j < files.size; j++)
         {
-            if (files[i].size != files[j].size)
+            if (files.data[i].size != files.data[j].size)
                 break;
             if (visited[j])
                 continue;
 
-            if (!files[i].hash_computed)
+            if (!files.data[i].hash_computed)
             {
-                compute_md5(files[i].path, files[i].hash);
-                files[i].hash_computed = 1;
+                compute_md5(files.data[i].path, files.data[i].hash);
+                files.data[i].hash_computed = 1;
             }
-            if (!files[j].hash_computed)
+            if (!files.data[j].hash_computed)
             {
-                compute_md5(files[j].path, files[j].hash);
-                files[j].hash_computed = 1;
+                compute_md5(files.data[j].path, files.data[j].hash);
+                files.data[j].hash_computed = 1;
             }
 
-            if (!hashes_equal(files[i].hash, files[j].hash))
+            if (!hashes_equal(files.data[i].hash, files.data[j].hash))
                 continue;
 
-            if (files_are_identical(files[i].path, files[j].path))
+            if (files_are_identical(files.data[i].path, files.data[j].path))
             {
-                group[count] = files[j].path;
-                group_sizes[count++] = files[j].size;
+                group[count] = files.data[j].path;
+                group_sizes[count++] = files.data[j].size;
                 visited[j] = 1;
             }
         }
@@ -311,6 +368,8 @@ static void process_groups(int total_groups, int auto_delete, int dry_run)
             prompt_group(group, group_sizes, count,
                          group_index, total_groups,
                          auto_delete, dry_run);
+            free(group);
+            free(group_sizes);
             visited[i] = 1;
         }
     }
@@ -439,10 +498,15 @@ static int prompt_group(char **group, size_t *sizes, int count,
         init_pair(6, COLOR_BLACK, COLOR_CYAN); /* status bar */
     }
 
-    int selected[MAX_FILES] = {0};
-    /* FIFO queue tracking the order in which files were selected.
-     * sel_queue[0] is the oldest selection.  sel_head is the count. */
-    int sel_queue[MAX_FILES];
+    int *selected = calloc(count, sizeof(int));
+    int *sel_queue = malloc(count * sizeof(int));
+
+    if (!selected || !sel_queue)
+    {
+        perror("malloc");
+        return 0;
+    }
+
     int sel_head = 0;
     int cursor = 0;
 
@@ -569,6 +633,8 @@ static int prompt_group(char **group, size_t *sizes, int count,
 
         if (ch == 'q' || ch == 'Q')
         {
+            free(selected);
+            free(sel_queue);
             endwin();
             return 0;
         }
@@ -628,6 +694,9 @@ static int prompt_group(char **group, size_t *sizes, int count,
     for (int i = 0; i < count; i++)
         if (selected[i])
             delete_file(group[i], sizes[i], dry_run);
+
+    free(selected);
+    free(sel_queue);
 
     return 1;
 }
@@ -708,10 +777,17 @@ int main(int argc, char *argv[])
     parse_args(argc, argv, &recursive, &auto_delete, &dry_run);
 
     setlocale(LC_ALL, "");
-    memset(visited, 0, sizeof(visited));
+    vec_init(&files);
 
     const char *folder = argv[optind];
     scan_and_sort(folder, recursive);
+
+    visited = calloc(files.size, sizeof(int));
+    if (!visited)
+    {
+        perror("calloc");
+        exit(1);
+    }
 
     int total_groups = count_duplicate_groups();
 
