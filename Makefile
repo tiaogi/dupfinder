@@ -6,7 +6,7 @@ DEBUG_FLAGS = -g -O0
 
 LIBS = -lncursesw -lcrypto
 
-SRC = main.c
+SRC = dupfinder.c
 OBJ = $(SRC:.c=.o)
 
 all: $(TARGET)

@@ -10,7 +10,7 @@
  *
  * Dependencies: openssl, ncursesw
  * Compile:
- *   gcc dupfinder.c -o dupfinder -lssl -lcrypto -lncursesw
+ *   gcc dupfinder.c -o dupfinder -lcrypto -lncursesw
  */
 
 #include <dirent.h>
