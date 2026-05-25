@@ -2,17 +2,21 @@
  * dupfinder.c — Interactive duplicate file finder
  *
  * Usage:
- *   dupfinder <folder> [-r] [-d] [-n] [-H] [-h]
+ *   dupfinder <folder> [-r] [-d] [-n] [-H] [-t <threads>] [-h]
  *
- *   -r    Scan subdirectories recursively
- *   -d    Auto-delete duplicates (keep first)
- *   -n    Dry-run (no deletion)
- *   -H    Include hidden files and directories (starting with .)
- *   -h    Show help
+ *   -r           Scan subdirectories recursively
+ *   -d           Auto-delete duplicates (keep first)
+ *   -n           Dry-run (no deletion)
+ *   -H           Include hidden files and directories (starting with .)
+ *   -t <n>       Number of threads (default: number of logical CPUs;
+ *                clamped to the system maximum if exceeded)
+ *   -h           Show help
  *
  * Build:
- *   gcc dupfinder.c -o dupfinder -lcrypto -lncursesw
+ *   gcc dupfinder.c -o dupfinder -lcrypto -lncursesw -lpthread
  */
+
+#define _GNU_SOURCE
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -20,10 +24,12 @@
 #include <ncursesw/ncurses.h>
 #include <openssl/evp.h>
 #include <openssl/md5.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -42,6 +48,7 @@ typedef struct
     size_t size;
     unsigned char hash[MD5_DIGEST_LENGTH];
     int hash_ready;
+    pthread_mutex_t hash_mutex; /* protects lazy hash computation */
 } FileEntry;
 
 typedef struct
@@ -49,7 +56,55 @@ typedef struct
     FileEntry *data;
     size_t len;
     size_t cap;
+    pthread_mutex_t mutex; /* protects concurrent push */
 } FileVec;
+
+/* ── Scan work-queue ────────────────────────────────────────────── */
+
+/*
+ * Each item in the queue is a directory path to scan.
+ * Threads pop items, scan them and push any sub-directories they find
+ * back into the queue (when recursive mode is on).
+ */
+typedef struct DirItem
+{
+    char *path;
+    struct DirItem *next;
+} DirItem;
+
+typedef struct
+{
+    DirItem *head;
+    DirItem *tail;
+    size_t size;
+    int idle;  /* threads currently waiting */
+    int total; /* total thread count        */
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int shutdown;
+} DirQueue;
+
+typedef struct
+{
+    DirQueue *q;
+    int recursive;
+    int include_hidden;
+} ScanArgs;
+
+/* ── Hash work-queue ────────────────────────────────────────────── */
+
+/*
+ * One task = compute MD5 of a single FileEntry (if not already done).
+ */
+typedef struct
+{
+    FileEntry **entries;
+    size_t count;
+    size_t next; /* index of next entry to process */
+    pthread_mutex_t mutex;
+    pthread_cond_t done_cond;
+    size_t finished;
+} HashQueue;
 
 /* ── Globals ────────────────────────────────────────────────────── */
 
@@ -72,17 +127,23 @@ static void vec_init(FileVec *v)
         perror("malloc");
         exit(1);
     }
+    pthread_mutex_init(&v->mutex, NULL);
 }
 
 static void vec_free(FileVec *v)
 {
     for (size_t i = 0; i < v->len; i++)
+    {
         free(v->data[i].path);
+        pthread_mutex_destroy(&v->data[i].hash_mutex);
+    }
     free(v->data);
+    pthread_mutex_destroy(&v->mutex);
 }
 
 static void vec_push(FileVec *v, FileEntry e)
 {
+    pthread_mutex_lock(&v->mutex);
     if (v->len >= v->cap)
     {
         size_t new_cap = v->cap * 2;
@@ -95,12 +156,14 @@ static void vec_push(FileVec *v, FileEntry e)
         v->data = new_data;
         v->cap = new_cap;
     }
+    e.hash_ready = 0;
+    pthread_mutex_init(&e.hash_mutex, NULL);
     v->data[v->len++] = e;
+    pthread_mutex_unlock(&v->mutex);
 }
 
 /* ── File utilities ─────────────────────────────────────────────── */
 
-/* Computes the MD5 digest of a file into `out`. Returns 1 on success. */
 static int compute_md5(const char *path, unsigned char *out)
 {
     FILE *fp = fopen(path, "rb");
@@ -129,7 +192,6 @@ static int compute_md5(const char *path, unsigned char *out)
     return 1;
 }
 
-/* Returns 1 if two files share the same byte content. */
 static int files_identical(const char *a, const char *b)
 {
     FILE *fa = fopen(a, "rb");
@@ -163,17 +225,18 @@ static int files_identical(const char *a, const char *b)
     return equal;
 }
 
-/* Lazily computes the MD5 of entry `e` (once only). */
+/* Thread-safe lazy MD5 computation. */
 static void ensure_hash(FileEntry *e)
 {
+    pthread_mutex_lock(&e->hash_mutex);
     if (!e->hash_ready)
     {
         compute_md5(e->path, e->hash);
         e->hash_ready = 1;
     }
+    pthread_mutex_unlock(&e->hash_mutex);
 }
 
-/* Returns 1 if two entries are confirmed duplicates. */
 static int entries_match(FileEntry *a, FileEntry *b)
 {
     if (a->size != b->size)
@@ -185,9 +248,107 @@ static int entries_match(FileEntry *a, FileEntry *b)
     return files_identical(a->path, b->path);
 }
 
-/* ── Directory scan ─────────────────────────────────────────────── */
+/* ── Dir-queue helpers ──────────────────────────────────────────── */
 
-static void scan_dir(const char *base, int recursive, int include_hidden)
+static void dirq_init(DirQueue *q, int total_threads)
+{
+    q->head = NULL;
+    q->tail = NULL;
+    q->size = 0;
+    q->idle = 0;
+    q->total = total_threads;
+    q->shutdown = 0;
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->cond, NULL);
+}
+
+static void dirq_destroy(DirQueue *q)
+{
+    /* drain any leftover items */
+    DirItem *it = q->head;
+    while (it)
+    {
+        DirItem *nx = it->next;
+        free(it->path);
+        free(it);
+        it = nx;
+    }
+    pthread_mutex_destroy(&q->mutex);
+    pthread_cond_destroy(&q->cond);
+}
+
+/* Push a directory path into the queue (takes ownership of `path`). */
+static void dirq_push(DirQueue *q, char *path)
+{
+    DirItem *item = malloc(sizeof(DirItem));
+    if (!item)
+    {
+        free(path);
+        return;
+    }
+    item->path = path;
+    item->next = NULL;
+
+    pthread_mutex_lock(&q->mutex);
+    if (q->tail)
+        q->tail->next = item;
+    else
+        q->head = item;
+    q->tail = item;
+    q->size++;
+    pthread_cond_signal(&q->cond);
+    pthread_mutex_unlock(&q->mutex);
+}
+
+/*
+ * Pop a path from the queue.
+ * Returns NULL only when there is no more work AND all threads are idle
+ * (i.e. the entire scan is finished).
+ */
+static char *dirq_pop(DirQueue *q)
+{
+    pthread_mutex_lock(&q->mutex);
+    q->idle++;
+
+    while (!q->shutdown)
+    {
+        if (q->head)
+        {
+            /* work available */
+            DirItem *item = q->head;
+            q->head = item->next;
+            if (!q->head)
+                q->tail = NULL;
+            q->size--;
+            q->idle--;
+            pthread_mutex_unlock(&q->mutex);
+            char *p = item->path;
+            free(item);
+            return p;
+        }
+
+        /* No work: are all threads idle? */
+        if (q->idle == q->total)
+        {
+            /* Broadcast so everyone wakes and exits */
+            q->shutdown = 1;
+            pthread_cond_broadcast(&q->cond);
+            pthread_mutex_unlock(&q->mutex);
+            return NULL;
+        }
+
+        pthread_cond_wait(&q->cond, &q->mutex);
+    }
+
+    q->idle--;
+    pthread_mutex_unlock(&q->mutex);
+    return NULL;
+}
+
+/* ── Scan thread ────────────────────────────────────────────────── */
+
+static void scan_dir_into_queue(const char *base, DirQueue *q,
+                                int recursive, int include_hidden)
 {
     DIR *dir = opendir(base);
     if (!dir)
@@ -201,13 +362,11 @@ static void scan_dir(const char *base, int recursive, int include_hidden)
 
     while ((de = readdir(dir)) != NULL)
     {
-        /* Always skip . and .. */
         if (de->d_name[0] == '.' &&
             (de->d_name[1] == '\0' ||
              (de->d_name[1] == '.' && de->d_name[2] == '\0')))
             continue;
 
-        /* Skip hidden entries unless -H was given */
         if (!include_hidden && de->d_name[0] == '.')
             continue;
 
@@ -220,19 +379,110 @@ static void scan_dir(const char *base, int recursive, int include_hidden)
 
         if (S_ISDIR(st.st_mode) && recursive)
         {
-            scan_dir(path, recursive, include_hidden);
+            char *copy = strdup(path);
+            if (copy)
+                dirq_push(q, copy);
         }
         else if (S_ISREG(st.st_mode))
         {
-            /* realpath() allocates a PATH_MAX buffer — we own the pointer. */
             char *resolved = realpath(path, NULL);
             if (resolved)
-                vec_push(&g_files, (FileEntry){.path = resolved, .size = (size_t)st.st_size});
+                vec_push(&g_files, (FileEntry){
+                                       .path = resolved,
+                                       .size = (size_t)st.st_size,
+                                       .hash_ready = 0});
         }
     }
 
     closedir(dir);
 }
+
+static void *scan_thread(void *arg)
+{
+    ScanArgs *sa = (ScanArgs *)arg;
+    char *path;
+
+    while ((path = dirq_pop(sa->q)) != NULL)
+    {
+        scan_dir_into_queue(path, sa->q, sa->recursive, sa->include_hidden);
+        free(path);
+    }
+
+    return NULL;
+}
+
+/* ── Hash thread pool ───────────────────────────────────────────── */
+
+static void *hash_thread(void *arg)
+{
+    HashQueue *hq = (HashQueue *)arg;
+
+    for (;;)
+    {
+        pthread_mutex_lock(&hq->mutex);
+        size_t idx = hq->next;
+        if (idx >= hq->count)
+        {
+            pthread_mutex_unlock(&hq->mutex);
+            break;
+        }
+        hq->next++;
+        pthread_mutex_unlock(&hq->mutex);
+
+        ensure_hash(hq->entries[idx]);
+
+        pthread_mutex_lock(&hq->mutex);
+        hq->finished++;
+        if (hq->finished == hq->count)
+            pthread_cond_broadcast(&hq->done_cond);
+        pthread_mutex_unlock(&hq->mutex);
+    }
+
+    return NULL;
+}
+
+/*
+ * Pre-compute MD5 for all files in a size-group using the thread pool.
+ * This avoids doing it lazily (and serially) inside entries_match().
+ */
+static void parallel_hash(FileEntry **entries, int count, int n_threads)
+{
+    if (count <= 0)
+        return;
+
+    HashQueue hq = {
+        .entries = entries,
+        .count = (size_t)count,
+        .next = 0,
+        .finished = 0};
+    pthread_mutex_init(&hq.mutex, NULL);
+    pthread_cond_init(&hq.done_cond, NULL);
+
+    int actual = n_threads < count ? n_threads : count;
+    pthread_t *tids = malloc(actual * sizeof(pthread_t));
+    if (!tids)
+    {
+        perror("malloc");
+        return;
+    }
+
+    for (int i = 0; i < actual; i++)
+        pthread_create(&tids[i], NULL, hash_thread, &hq);
+
+    pthread_mutex_lock(&hq.mutex);
+    while (hq.finished < hq.count)
+        pthread_cond_wait(&hq.done_cond, &hq.mutex);
+    pthread_mutex_unlock(&hq.mutex);
+
+    for (int i = 0; i < actual; i++)
+        pthread_join(tids[i], NULL);
+
+    free(tids);
+    pthread_mutex_destroy(&hq.mutex);
+    pthread_cond_destroy(&hq.done_cond);
+}
+
+/* ── Directory scan entry-point ─────────────────────────────────── */
 
 static int cmp_size(const void *a, const void *b)
 {
@@ -241,36 +491,64 @@ static int cmp_size(const void *a, const void *b)
     return (sa > sb) - (sa < sb);
 }
 
-static void scan_and_sort(const char *path, int recursive, int include_hidden)
+static void scan_and_sort(const char *root, int recursive,
+                          int include_hidden, int n_threads)
 {
-    printf("Scanning %s%s%s…\n",
-           path,
+    printf("Scanning %s%s%s… (%d thread%s)\n",
+           root,
            recursive ? " (recursive)" : "",
-           include_hidden ? " (including hidden)" : "");
-    scan_dir(path, recursive, include_hidden);
+           include_hidden ? " (including hidden)" : "",
+           n_threads,
+           n_threads > 1 ? "s" : "");
+
+    DirQueue q;
+    dirq_init(&q, n_threads);
+
+    /* Seed the queue with the root directory */
+    char *root_copy = strdup(root);
+    if (!root_copy)
+    {
+        perror("strdup");
+        exit(1);
+    }
+    dirq_push(&q, root_copy);
+
+    ScanArgs sa = {.q = &q, .recursive = recursive, .include_hidden = include_hidden};
+
+    pthread_t *tids = malloc(n_threads * sizeof(pthread_t));
+    if (!tids)
+    {
+        perror("malloc");
+        exit(1);
+    }
+
+    for (int i = 0; i < n_threads; i++)
+        pthread_create(&tids[i], NULL, scan_thread, &sa);
+
+    for (int i = 0; i < n_threads; i++)
+        pthread_join(tids[i], NULL);
+
+    free(tids);
+    dirq_destroy(&q);
+
     qsort(g_files.data, g_files.len, sizeof(FileEntry), cmp_size);
     printf("Found %zu file(s). Looking for duplicates…\n\n", g_files.len);
 }
 
+/* ── Progress bar ───────────────────────────────────────────────── */
+
 static void print_progress(size_t i, size_t total)
 {
     int width = 30;
-
     float ratio = total ? (float)i / (float)total : 0.0f;
     if (ratio > 1.0f)
         ratio = 1.0f;
-
     int filled = (int)(ratio * width);
 
     printf("\r[");
     for (int j = 0; j < width; j++)
         putchar(j < filled ? '#' : '-');
-
-    printf("] %3d%% (%zu/%zu)",
-           (int)(ratio * 100),
-           i,
-           total);
-
+    printf("] %3d%% (%zu/%zu)", (int)(ratio * 100), i, total);
     fflush(stdout);
 }
 
@@ -290,29 +568,19 @@ static void delete_file(const char *path, size_t size, int dry_run)
         g_freed += (long long)size;
     }
     else
-    {
         perror("  remove");
-    }
 }
 
 /* ── File opener ────────────────────────────────────────────────── */
 
-/*
- * Opens a file with the system's default application via xdg-open.
- * Forks a child process so ncurses is not disturbed; the application
- * runs in the background while the TUI stays active.
- * stdout/stderr of the child are redirected to /dev/null to prevent
- * any output from xdg-open from corrupting the ncurses display.
- */
 static void open_file(const char *path)
 {
     pid_t pid = fork();
     if (pid < 0)
-        return; /* fork failed — silently ignore */
+        return;
 
     if (pid == 0)
     {
-        /* ── child ── */
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0)
         {
@@ -320,16 +588,11 @@ static void open_file(const char *path)
             dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
-        /* Detach from the process group so signals (e.g. SIGINT) sent to
-         * the parent terminal do not reach the spawned application. */
         setsid();
         execlp("xdg-open", "xdg-open", path, NULL);
-        _exit(1); /* execlp failed */
+        _exit(1);
     }
 
-    /* ── parent ──
-     * WNOHANG: don't block the TUI — the child (and the app it launches)
-     * lives on independently after xdg-open exits. */
     waitpid(pid, NULL, WNOHANG);
 }
 
@@ -345,7 +608,6 @@ static void format_size(char *buf, size_t sz)
         snprintf(buf, 16, "%zu B", sz);
 }
 
-/* Shows the tail of the path so the filename is always visible. */
 static void print_truncated(int row, int col, const char *path, int max_cols)
 {
     int len = (int)strlen(path);
@@ -355,13 +617,13 @@ static void print_truncated(int row, int col, const char *path, int max_cols)
         mvprintw(row, col, "…%s", path + (len - max_cols + 1));
 }
 
-/* ── ncurses color helpers ──────────────────────────────────────── */
+/* ── ncurses colors ─────────────────────────────────────────────── */
 
-#define CP_HEADER 1 /* cyan   — section labels          */
-#define CP_OK 2     /* green  — selected files          */
-#define CP_CURSOR 3 /* yellow — cursor row              */
-#define CP_DANGER 4 /* red    — file sizes              */
-#define CP_STATUS 6 /* black on cyan — top/bottom bars  */
+#define CP_HEADER 1
+#define CP_OK 2
+#define CP_CURSOR 3
+#define CP_DANGER 4
+#define CP_STATUS 6
 
 static void init_colors(void)
 {
@@ -376,16 +638,10 @@ static void init_colors(void)
 
 /* ── Interactive prompt ─────────────────────────────────────────── */
 
-/*
- * Displays a group of duplicate files in a full-screen ncurses UI.
- * Navigation: ↑/↓ or j/k · SPACE toggles selection · O opens · ENTER confirms · Q skips.
- * At least one file is always kept (selection is capped at count-1).
- */
 static int prompt_group(char **paths, size_t *sizes, int count,
                         int group_idx, int total_groups,
                         int auto_delete, int dry_run)
 {
-    /* In auto mode we silently keep the first file and delete the rest. */
     if (auto_delete)
     {
         for (int i = 1; i < count; i++)
@@ -425,7 +681,6 @@ static int prompt_group(char **paths, size_t *sizes, int count,
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
 
-        /* Top status bar */
         if (color)
             attron(COLOR_PAIR(CP_STATUS) | A_BOLD);
         for (int c = 0; c < cols; c++)
@@ -435,14 +690,12 @@ static int prompt_group(char **paths, size_t *sizes, int count,
         if (color)
             attroff(COLOR_PAIR(CP_STATUS) | A_BOLD);
 
-        /* Section label */
         if (color)
             attron(COLOR_PAIR(CP_HEADER) | A_BOLD);
         mvprintw(2, 2, "DUPLICATE FILES");
         if (color)
             attroff(COLOR_PAIR(CP_HEADER) | A_BOLD);
 
-        /* File list */
         for (int i = 0; i < count && (4 + i) < rows - 4; i++)
         {
             int row = 4 + i;
@@ -490,7 +743,6 @@ static int prompt_group(char **paths, size_t *sizes, int count,
             }
         }
 
-        /* Key hints */
         if (color)
             attron(COLOR_PAIR(CP_HEADER));
         mvprintw(rows - 3, 2,
@@ -498,7 +750,6 @@ static int prompt_group(char **paths, size_t *sizes, int count,
         if (color)
             attroff(COLOR_PAIR(CP_HEADER));
 
-        /* Bottom status bar */
         int n_sel = 0;
         size_t bytes_freed = 0;
         for (int i = 0; i < count; i++)
@@ -522,13 +773,10 @@ static int prompt_group(char **paths, size_t *sizes, int count,
 
         refresh();
 
-        /* Input handling */
         int ch = getch();
 
         if (ch == 'q' || ch == 'Q')
-        {
             break;
-        }
         else if (ch == KEY_UP || ch == 'k')
         {
             if (cursor > 0)
@@ -543,7 +791,6 @@ static int prompt_group(char **paths, size_t *sizes, int count,
         {
             if (selected[cursor])
             {
-                /* Deselect — remove from queue */
                 selected[cursor] = 0;
                 int w = 0;
                 for (int i = 0; i < sel_head; i++)
@@ -553,7 +800,6 @@ static int prompt_group(char **paths, size_t *sizes, int count,
             }
             else
             {
-                /* Evict oldest if we would select all (must keep one) */
                 if (sel_head >= count - 1)
                 {
                     selected[sel_queue[0]] = 0;
@@ -568,17 +814,13 @@ static int prompt_group(char **paths, size_t *sizes, int count,
             memset(selected, 0, count * sizeof(int));
             sel_head = 0;
         }
-        else if (ch == ('o' & 0x1f)) /* Ctrl+O — open all files in the group */
+        else if (ch == ('o' & 0x1f))
         {
             for (int i = 0; i < count; i++)
                 open_file(paths[i]);
         }
         else if (ch == 'o' || ch == 'O')
-        {
-            /* Open the file under the cursor with the system default app.
-             * ncurses stays active — the app launches in the background. */
             open_file(paths[cursor]);
-        }
         else if (ch == '\n' || ch == KEY_ENTER)
         {
             endwin();
@@ -597,70 +839,90 @@ static int prompt_group(char **paths, size_t *sizes, int count,
     return 0;
 }
 
-/* ── Group processing (single pass) ────────────────────────────── */
+/* ── Group processing ───────────────────────────────────────────── */
 
-/*
- * Iterates over size-sorted files.  For each unvisited file, gathers all
- * entries with the same size + hash + byte content into a group, then
- * either counts them (dry pass) or interactively handles them (live pass).
- *
- * `on_group` receives (paths, sizes, count, group_index, total, auto_delete,
- * dry_run) and returns 1 if the group was processed, 0 if skipped.
- */
 typedef int (*GroupHandler)(char **, size_t *, int, int, int, int, int);
 
 static int iterate_groups(int total, GroupHandler on_group,
-                          int auto_delete, int dry_run)
+                          int auto_delete, int dry_run, int n_threads)
 {
     memset(g_visited, 0, g_files.len * sizeof(int));
     int group_idx = 0;
 
-    for (size_t i = 0; i < g_files.len; i++)
+    /* We work on slices of consecutive same-size files.
+     * For each slice we pre-hash all entries in parallel, then do the
+     * pairwise comparison (still serial — avoids false sharing on g_visited). */
+
+    size_t i = 0;
+    while (i < g_files.len)
     {
         g_progress = i;
         print_progress(i, g_files.len);
 
-        if (g_visited[i])
-            continue;
+        /* Find the end of the current size-group */
+        size_t j = i + 1;
+        while (j < g_files.len &&
+               g_files.data[j].size == g_files.data[i].size)
+            j++;
 
-        char **paths = malloc(g_files.len * sizeof(*paths));
-        size_t *szs = malloc(g_files.len * sizeof(*szs));
-        if (!paths || !szs)
+        /* If more than one file shares this size, pre-hash them all in parallel */
+        if (j - i > 1)
         {
-            perror("malloc");
+            int slice_len = (int)(j - i);
+            FileEntry **slice = malloc(slice_len * sizeof(FileEntry *));
+            if (slice)
+            {
+                for (int k = 0; k < slice_len; k++)
+                    slice[k] = &g_files.data[i + k];
+                parallel_hash(slice, slice_len, n_threads);
+                free(slice);
+            }
+        }
+
+        /* Now do serial pairwise matching within the slice */
+        for (size_t ii = i; ii < j; ii++)
+        {
+            if (g_visited[ii])
+                continue;
+
+            char **paths = malloc(g_files.len * sizeof(*paths));
+            size_t *szs = malloc(g_files.len * sizeof(*szs));
+            if (!paths || !szs)
+            {
+                perror("malloc");
+                free(paths);
+                free(szs);
+                return group_idx;
+            }
+
+            int count = 0;
+            paths[count] = g_files.data[ii].path;
+            szs[count++] = g_files.data[ii].size;
+
+            for (size_t jj = ii + 1; jj < j; jj++)
+            {
+                if (g_visited[jj])
+                    continue;
+                if (!entries_match(&g_files.data[ii], &g_files.data[jj]))
+                    continue;
+                paths[count] = g_files.data[jj].path;
+                szs[count++] = g_files.data[jj].size;
+                g_visited[jj] = 1;
+            }
+
+            if (count > 1)
+            {
+                group_idx++;
+                if (on_group)
+                    on_group(paths, szs, count, group_idx, total, auto_delete, dry_run);
+                g_visited[ii] = 1;
+            }
+
             free(paths);
             free(szs);
-            return group_idx;
         }
 
-        int count = 0;
-        paths[count] = g_files.data[i].path;
-        szs[count++] = g_files.data[i].size;
-
-        for (size_t j = i + 1; j < g_files.len; j++)
-        {
-            if (g_files.data[j].size != g_files.data[i].size)
-                break;
-            if (g_visited[j])
-                continue;
-            if (!entries_match(&g_files.data[i], &g_files.data[j]))
-                continue;
-
-            paths[count] = g_files.data[j].path;
-            szs[count++] = g_files.data[j].size;
-            g_visited[j] = 1;
-        }
-
-        if (count > 1)
-        {
-            group_idx++;
-            if (on_group)
-                on_group(paths, szs, count, group_idx, total, auto_delete, dry_run);
-            g_visited[i] = 1;
-        }
-
-        free(paths);
-        free(szs);
+        i = j;
     }
 
     print_progress(g_files.len, g_files.len);
@@ -669,13 +931,13 @@ static int iterate_groups(int total, GroupHandler on_group,
     return group_idx;
 }
 
-static int count_groups(void) { return iterate_groups(0, NULL, 0, 0); }
-static void process_groups(int total, int ad, int dr)
+static int count_groups(int nt) { return iterate_groups(0, NULL, 0, 0, nt); }
+static void process_groups(int total, int ad, int dr, int nt)
 {
     g_total = g_files.len;
     g_progress = 0;
     printf("\n");
-    iterate_groups(total, prompt_group, ad, dr);
+    iterate_groups(total, prompt_group, ad, dr, nt);
 }
 
 /* ── Summary ────────────────────────────────────────────────────── */
@@ -691,8 +953,37 @@ static void print_summary(int total_groups, int dry_run)
     printf("│  Groups found   : %-13d │\n", total_groups);
     if (dry_run)
         printf("│  Mode           : DRY-RUN       │\n");
-    printf("│  %-15s: %-13s │\n", dry_run ? "Would free" : "Space freed", freed_str);
+    printf("│  %-15s: %-13s │\n",
+           dry_run ? "Would free" : "Space freed", freed_str);
     printf("└─────────────────────────────────┘\n");
+}
+
+/* ── Thread count helper ────────────────────────────────────────── */
+
+/*
+ * Returns the number of threads to use:
+ *   - default (requested == 0): all logical CPUs
+ *   - explicit: clamped to [1, nprocs]
+ */
+static int resolve_threads(int requested)
+{
+    int nprocs = get_nprocs(); /* <sys/sysinfo.h> */
+    if (nprocs < 1)
+        nprocs = 1;
+
+    if (requested <= 0)
+        return nprocs;
+
+    if (requested > nprocs)
+    {
+        fprintf(stderr,
+                "Warning: requested %d threads but system has only %d logical CPU(s). "
+                "Clamping to %d.\n",
+                requested, nprocs, nprocs);
+        return nprocs;
+    }
+
+    return requested;
 }
 
 /* ── Argument parsing ───────────────────────────────────────────── */
@@ -706,22 +997,24 @@ static const char *prog_name(const char *argv0)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s <folder> [-r] [-d] [-n] [-H] [-h]\n\n"
+            "Usage: %s <folder> [-r] [-d] [-n] [-H] [-t <threads>] [-h]\n\n"
             "Options:\n"
-            "  -r    Scan subdirectories recursively\n"
-            "  -d    Auto-delete duplicates (keep first)\n"
-            "  -n    Dry-run (no deletion)\n"
-            "  -H    Include hidden files and directories (starting with .)\n"
-            "  -h    Show help\n",
+            "  -r           Scan subdirectories recursively\n"
+            "  -d           Auto-delete duplicates (keep first)\n"
+            "  -n           Dry-run (no deletion)\n"
+            "  -H           Include hidden files and directories (starting with .)\n"
+            "  -t <n>       Number of threads (default: logical CPU count;\n"
+            "               clamped to system maximum if exceeded)\n"
+            "  -h           Show help\n",
             prog_name(argv0));
 }
 
 static void parse_args(int argc, char *argv[],
                        int *recursive, int *auto_delete, int *dry_run,
-                       int *include_hidden)
+                       int *include_hidden, int *n_threads)
 {
     int opt;
-    while ((opt = getopt(argc, argv, "rdnHh")) != -1)
+    while ((opt = getopt(argc, argv, "rdnHt:h")) != -1)
     {
         switch (opt)
         {
@@ -736,6 +1029,15 @@ static void parse_args(int argc, char *argv[],
             break;
         case 'H':
             *include_hidden = 1;
+            break;
+        case 't':
+            *n_threads = atoi(optarg);
+            if (*n_threads < 1)
+            {
+                fprintf(stderr, "Error: -t requires a positive integer.\n");
+                usage(argv[0]);
+                exit(1);
+            }
             break;
         case 'h':
             usage(argv[0]);
@@ -763,11 +1065,16 @@ int main(int argc, char *argv[])
     }
 
     int recursive = 0, auto_delete = 0, dry_run = 0, include_hidden = 0;
-    parse_args(argc, argv, &recursive, &auto_delete, &dry_run, &include_hidden);
+    int requested_threads = 0; /* 0 = use all CPUs */
+
+    parse_args(argc, argv, &recursive, &auto_delete, &dry_run,
+               &include_hidden, &requested_threads);
+
+    int n_threads = resolve_threads(requested_threads);
 
     setlocale(LC_ALL, "");
     vec_init(&g_files);
-    scan_and_sort(argv[optind], recursive, include_hidden);
+    scan_and_sort(argv[optind], recursive, include_hidden, n_threads);
 
     g_visited = calloc(g_files.len, sizeof(int));
     if (!g_visited)
@@ -776,7 +1083,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int total = count_groups();
+    int total = count_groups(n_threads);
     if (total == 0)
     {
         printf("No duplicates found. You're all clean!\n");
@@ -785,7 +1092,7 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    process_groups(total, auto_delete, dry_run);
+    process_groups(total, auto_delete, dry_run, n_threads);
     print_summary(total, dry_run);
 
     vec_free(&g_files);
